@@ -5,6 +5,7 @@ import requests
 import time
 import math
 import json
+import pprint
 
 BASE_URL = "https://api.stockfighter.io/ob/api"
 with open("api_key.json") as f:
@@ -23,13 +24,13 @@ def stock_url(venue, stock):
 
 
 def order_url(order):
-    return stock_url(order['venue'], order['symbol']) + "/{}".format(order['id'])
+    return stock_url(order['venue'], order['symbol']) + "/orders/{}".format(order['id'])
 
 
 def get_average_price(venue, stock, n=5, delay=1):
     url = stock_url(venue, stock) + "/quote"
     prices = []
-    for _ in xrange(n):
+    for i in xrange(n):
         r = requests.get(url, **api_key())
         r.raise_for_status()
         quote = r.json()
@@ -42,23 +43,24 @@ def get_average_price(venue, stock, n=5, delay=1):
         print "Got price quote: {}".format(price)
         prices.append(price)
 
-        time.sleep(delay)
+        if i + 1 < n:
+            time.sleep(delay)
 
     return int(math.ceil(sum(prices) / float(n)))
 
 
-def bid(account, venue, stock, price_per_share, shares):
+def order(account, venue, stock, price_per_share, shares, direction):
     order = {
         'account': account,
         'venue': venue,
         'stock': stock,
-        'price': price_per_share * shares,
+        'price': price_per_share,
         'qty': shares,
-        'direction': 'buy',
+        'direction': direction,
         'orderType': 'limit'
     }
     url = stock_url(venue, stock) + "/orders"
-    r = requests.post(url, data=order, **api_key())
+    r = requests.post(url, json=order, **api_key())
     r.raise_for_status()
 
     response = r.json()
@@ -67,22 +69,34 @@ def bid(account, venue, stock, price_per_share, shares):
     return response
 
 
+def bid(account, venue, stock, price_per_share, shares):
+    return order(account, venue, stock, price_per_share, shares, 'buy')
+
+
+def ask(account, venue, stock, price_per_share, shares):
+    return order(account, venue, stock, price_per_share, shares, 'sell')
+
+
 def order_is_filled(order):
-    r = requests.get(order_url(order))
+    r = requests.get(order_url(order), **api_key())
     r.raise_for_status()
-    return r.json()['open'], order
+    return not r.json()['open'], order
 
 
 def wait_for_fill(order, poll=1, checks=5):
     start = time.time()
-    for _ in xrange(checks):
+    for i in xrange(checks):
         filled, order = order_is_filled(order)
         if filled:
+            print "Order filled"
+            pprint.pprint(order, indent=2)
             return order['originalQty']
+        print "Order not yet filled"
 
-        time.sleep(poll)
+        if i + 1 < checks:
+            time.sleep(poll)
 
-    r = requests.delete(order_url(order))
+    r = requests.delete(order_url(order), **api_key())
     r.raise_for_status()
     return r.json()['totalFilled']
 
@@ -98,14 +112,35 @@ def main():
 
     bought = 0
     target = 100000
-    shares_per_bid = 10
+    shares_per_bid = 200
+    shares_per_sell = 50
+    buys_per_sell = 3  # every N buys, sell some
+    price = None
+    time_between_bids = 5.0 / 24
+    buys = 0
+
+    price = int(get_average_price(args.venue, args.stock, n=1) * 1.1)
     while bought < target:
-        price = int(get_average_price(args.venue, args.stock) * 1.1)
         print "Bidding for {} shares at {} apiece".format(shares_per_bid, price)
+        bid_time = time.time()
         order = bid(args.account, args.venue, args.stock, price, shares_per_bid)
         shares = wait_for_fill(order)
+        fill_time = time.time()
+
+        sleep_time = max(0, time_between_bids - (fill_time - bid_time))
+        if sleep_time > 0:
+            print "Sleeping for {} seconds".format(sleep_time)
+            time.sleep(sleep_time)
         bought += shares
 
+        if shares > 0:
+            buys += 1
+
+            if buys % buys_per_sell == 0:
+                print "Asking for {} per share for {} shares".format(price, shares_per_sell)
+                order = ask(args.account, args.venue, args.stock, int(price * 0.7), shares_per_sell)
+                shares = wait_for_fill(order)
+                bought -= shares
 
 if __name__ == '__main__':
     main()
